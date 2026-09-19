@@ -5,3 +5,10 @@ configure
 duckdb_unittest_tempdir
 /test/bin
 venv
+
+# A local copy of WFLing-seaer/pinyinparser, read for the bit layout and the
+# 声韵调 tables. That repository carries no license, so nothing from it may be
+# redistributed — the encoding rules are reimplemented in src/pinyin.rs and
+# src/pinyin_data.rs is generated from mozillazg/pinyin-data instead. Kept
+# here only so the reference stays to hand.
+tools/ref/

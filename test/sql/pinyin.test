@@ -1,0 +1,449 @@
+# name: test/sql/pinyin.test
+# description: test the PINYIN column type and pinyin_match
+# group: [quack]
+
+# Before we load the extension, neither the type nor the function exists.
+statement error
+SELECT 'zhong1'::PINYIN;
+----
+Catalog Error
+
+statement error
+SELECT pinyin_match('zhong1'::PINYIN, 'p?');
+----
+Catalog Error
+
+require rusty_quack
+
+# --- the type itself --------------------------------------------------------
+
+# PINYIN is an alias of USMALLINT, so it costs 2 bytes per value.
+query T
+SELECT typeof('zhong1'::PINYIN);
+----
+PINYIN
+
+# The catalog agrees: storage is USMALLINT, 2 bytes.
+query TI
+SELECT logical_type, type_size FROM duckdb_types() WHERE type_name = 'PINYIN';
+----
+USMALLINT	2
+
+# --- encoding ---------------------------------------------------------------
+
+# The bit layout is the reference's: bit 15 is the 声母 variant-select,
+# bits 14..13 the 韵母 variant-select, 12..8 the 韵母 base, 7..5 the 声调,
+# 4..0 the 声母 base.
+query TTTT
+SELECT to_hex('zhong1'::PINYIN::USMALLINT),
+       to_hex('pīng'::PINYIN::USMALLINT),
+       to_hex('pá'::PINYIN::USMALLINT),
+       to_hex('shǎng'::PINYIN::USMALLINT);
+----
+8E96	168E	3AE	86D1
+
+# The spelling, the marked form and the digit form are one value; a syllable
+# written with no tone at all is a *different* value, tone = 未指定.
+query IIII
+SELECT 'zhong1'::PINYIN::USMALLINT = 'zhōng'::PINYIN::USMALLINT,
+       'zhong'::PINYIN::USMALLINT  = 'zhong1'::PINYIN::USMALLINT,
+       to_hex('zhong'::PINYIN::USMALLINT) = '8E16',
+       to_hex('zhong0'::PINYIN::USMALLINT) = '8E36';
+----
+true	false	true	true
+
+# 声母 is bits 0..4 plus the variant bit: masking the variant collapses
+# ch/sh/zh onto c/s/z. (DuckDB has no 0x literals, so the masks are decimal:
+# 31 = 0x001F, 32799 = 0x801F.)
+query TTT
+SELECT to_hex('zhong1'::PINYIN::USMALLINT & 31),
+       to_hex('chī'::PINYIN::USMALLINT & 31),
+       to_hex('zhong1'::PINYIN::USMALLINT & 32799);
+----
+16	4	8016
+
+# 平声 is 阴平 + 阳平, which is one masked compare; 仄声 is its complement.
+# 192 = 0x00C0 masks the two high 声调 bits.
+query IIII
+SELECT 'zhōng'::PINYIN::USMALLINT & 192,
+       'pá'::PINYIN::USMALLINT    & 192,
+       'shǎng'::PINYIN::USMALLINT & 192,
+       'pà'::PINYIN::USMALLINT    & 192;
+----
+128	128	192	192
+
+# A 声调 *class* spans two values, so no single pattern reaches it — 平声 is
+# 阴平 + 阳平, which is one masked compare on the u16 (192 = 0x00C0 masks the
+# two high 声调 bits, 128 = 0x0080 is the shared prefix of 阴平 and 阳平).
+# A syllable written with no tone is in neither class.
+query TT
+SELECT s::VARCHAR, (s::USMALLINT & 192) = 128
+FROM (SELECT s::PINYIN AS s FROM (VALUES ('zhōng'), ('pá'), ('shǎng'), ('pà'), ('de')) v(s));
+----
+zhōng	true
+pá	true
+shǎng	false
+pà	false
+de	false
+
+# Masking the 声母 variant bit collapses ch/sh/zh onto c/s/z, which is how a
+# "z or zh" filter is written (22 = 0x16 is the base of both z and zh).
+query TTTT
+SELECT ('zhī'::PINYIN::USMALLINT & 31) = 22,
+       ('zī'::PINYIN::USMALLINT & 31) = 22,
+       ('chī'::PINYIN::USMALLINT & 31) = 22,
+       ('zhī'::PINYIN::USMALLINT & 31) = 4;
+----
+true	true	false	false
+
+# --- rendering --------------------------------------------------------------
+
+query TT
+SELECT 'zhong1'::PINYIN::VARCHAR, 'zhong'::PINYIN::VARCHAR;
+----
+zhōng	zhong
+
+# Tone placement follows the 汉语拼音 rule: a > o > e > the last vowel.
+query TTTT
+SELECT 'shang3'::PINYIN::VARCHAR,
+       'liu2'::PINYIN::VARCHAR,
+       'gui4'::PINYIN::VARCHAR,
+       'lüe4'::PINYIN::VARCHAR;
+----
+shǎng	liú	guì	lüè
+
+# --- casts ------------------------------------------------------------------
+
+# A string that is not a pinyin syllable is an error, and TRY_CAST is NULL.
+statement error
+SELECT 'not a syllable'::PINYIN;
+----
+Invalid pinyin syllable: 'not a syllable'
+
+query T
+SELECT TRY_CAST('not a syllable' AS PINYIN);
+----
+NULL
+
+# TRY_CAST passes a good syllable straight through.
+query T
+SELECT TRY_CAST('zhong1' AS PINYIN)::VARCHAR || '!';
+----
+zhōng!
+
+# The type flows into anything that takes a u16.
+query II
+SELECT 'zhong1'::PINYIN + 1, length('zhong1'::PINYIN::VARCHAR);
+----
+36503	5
+
+# --- pinyin_match -----------------------------------------------------------
+
+# A pattern is a syllable with any part replaced by a wildcard, and a part that
+# is simply not written is a wildcard too. Matching is one masked compare.
+query TT
+SELECT pinyin_match('zhong1'::PINYIN, 'zhong')::VARCHAR,
+       pinyin_match('zhong1'::PINYIN, 'zhong1')::VARCHAR;
+----
+true	true
+
+query TT
+SELECT pinyin_match('zhong1'::PINYIN, 'zhong2')::VARCHAR,
+       pinyin_match('pīng'::PINYIN, 'zhong')::VARCHAR;
+----
+false	false
+
+# `p?` and a bare `p` both mean 声母 p with everything else free.
+query TTT
+SELECT pinyin_match('pīng'::PINYIN, 'p?')::VARCHAR,
+       pinyin_match('pá'::PINYIN, 'p')::VARCHAR,
+       pinyin_match('zhōng'::PINYIN, 'p')::VARCHAR;
+----
+true	true	false
+
+# A bare final constrains only the 韵母; `*` and `?` constrain nothing.
+query TTTT
+SELECT pinyin_match('shǎng'::PINYIN, '?ang')::VARCHAR,
+       pinyin_match('pīng'::PINYIN, '?ang')::VARCHAR,
+       pinyin_match('zhōng'::PINYIN, '*')::VARCHAR,
+       pinyin_match('zhōng'::PINYIN, '?')::VARCHAR;
+----
+true	false	true	true
+
+# A bare tone digit, and `/` for the zero initial.
+query TTTT
+SELECT pinyin_match('zhōng'::PINYIN, '1')::VARCHAR,
+       pinyin_match('shǎng'::PINYIN, '3')::VARCHAR,
+       pinyin_match('zhōng'::PINYIN, '3')::VARCHAR,
+       pinyin_match('zhōng'::PINYIN, '/')::VARCHAR;
+----
+true	true	false	false
+
+# 零声母 and 伪声母 R.
+query TT
+SELECT pinyin_match('ān'::PINYIN, '/')::VARCHAR,
+       pinyin_match('ér'::PINYIN, '/')::VARCHAR;
+----
+true	true
+
+# The phonemic split is not the written one: `chi` is ch + ri, `zi` is z + ii,
+# `ju` is j + v, `liu` is l + iou. The 韵母 a pattern names is resolved the
+# same way, so these agree.
+query TTT
+SELECT pinyin_match('chī'::PINYIN, 'ch?')::VARCHAR,
+       pinyin_match('liú'::PINYIN, '?iou')::VARCHAR,
+       pinyin_match('jū'::PINYIN, '?v')::VARCHAR;
+----
+true	true	true
+
+# --- what the first argument may be -----------------------------------------
+
+# `pinyin_match` has a PINYIN and a PINYIN[] overload, so an *untyped* string
+# literal does not say which one is meant — the two are different types, and
+# DuckDB refuses to guess.
+statement error
+SELECT pinyin_match('zhong1', 'zhong');
+----
+Binder Error
+
+# Spell the type out and the literal binds through its own parse rather than
+# being read as a number.
+query TT
+SELECT pinyin_match('zhong1'::PINYIN, 'zhong')::VARCHAR,
+       pinyin_match('zhong1'::PINYIN, 'p?')::VARCHAR;
+----
+true	false
+
+query TT
+SELECT pinyin_match(v, 'zhong')::VARCHAR, pinyin_match(v, '?ang')::VARCHAR
+FROM (VALUES ('zhong1'), ('shǎng')) t(v)
+ORDER BY v;
+----
+false	true
+true	false
+
+# A bad literal reports the pinyin error, not a numeric conversion error.
+statement error
+SELECT pinyin_match('not a syllable'::PINYIN, 'p?');
+----
+Invalid pinyin syllable: 'not a syllable'
+
+# A USMALLINT *column* is not implicitly a PINYIN — an arbitrary integer has not
+# been parsed — so it takes an explicit cast. A plain integer literal folds at
+# bind time and does bind.
+statement error
+SELECT pinyin_match(n, 'zhong') FROM (VALUES (36502)) t(n);
+----
+Binder Error
+
+query TT
+SELECT pinyin_match(36502, 'zhong')::VARCHAR,
+       pinyin_match(36502::PINYIN, 'zhong')::VARCHAR;
+----
+true	true
+
+# --- pinyin_match over PINYIN[] ---------------------------------------------
+
+# PINYIN[] is LIST(PINYIN), a real type of its own — so a list value and a list
+# column both reach the second overload without a cast.
+query T
+SELECT typeof(['zhong1', 'guo2']::PINYIN[]);
+----
+PINYIN[]
+
+# The pattern is the syllables separated by spaces, matched element by element.
+query TTTT
+SELECT pinyin_match(['zhong1', 'guo2']::PINYIN[], 'zhong guo')::VARCHAR,
+       pinyin_match(['zhong1', 'guo2']::PINYIN[], 'guo zhong')::VARCHAR,
+       pinyin_match(['zhong1', 'guo2']::PINYIN[], 'zhong guo ren')::VARCHAR,
+       pinyin_match(['zhong1', 'guo2']::PINYIN[], 'zhong')::VARCHAR;
+----
+true	false	false	false
+
+# A 声调 written in the pattern is part of that element, so `zhong` reaches
+# 中 whatever its 声调 and `zhong1` only 阴平.
+query TT
+SELECT pinyin_match(['zhong1', 'guo2']::PINYIN[], 'zhong1 guo2')::VARCHAR,
+       pinyin_match(['zhong4', 'guo2']::PINYIN[], 'zhong1 guo2')::VARCHAR;
+----
+true	false
+
+# `*` is exactly one syllable, the same thing it means in a one-syllable
+# pattern. So a bare `*` says "any syllable, and there is exactly one of them".
+query TTTT
+SELECT pinyin_match(['zhong1', 'guo2']::PINYIN[], '* *')::VARCHAR,
+       pinyin_match(['zhong1', 'guo2']::PINYIN[], '*')::VARCHAR,
+       pinyin_match(['zhong1', 'guo2', 'ren2']::PINYIN[], '* *')::VARCHAR,
+       pinyin_match(['zhong1', 'guo2']::PINYIN[], '? ?')::VARCHAR;
+----
+true	false	false	true
+
+# `**` is any *number* of syllables, including none at all — so it is what
+# makes a pattern match a phrase of unknown length.
+query TTTT
+SELECT pinyin_match(['zhong1', 'guo2']::PINYIN[], 'zhong ** guo')::VARCHAR,
+       pinyin_match(['zhong1', 'ren2', 'min2', 'guo2']::PINYIN[], 'zhong ** guo')::VARCHAR,
+       pinyin_match(['zhong1', 'guo2']::PINYIN[], 'zhong **')::VARCHAR,
+       pinyin_match(['zhong1', 'guo2']::PINYIN[], '** guo')::VARCHAR;
+----
+true	true	true	true
+
+query TT
+SELECT pinyin_match(['zhong1', 'guo2']::PINYIN[], '**')::VARCHAR,
+       pinyin_match(['zhong1', 'guo2']::PINYIN[], '** zhong ** guo **')::VARCHAR;
+----
+true	true
+
+# A single-声母 or single-韵母 pattern works inside a sequence, and 声调 still
+# narrows it. `p * *` is three syllables, the first with 声母 p.
+query TTTT
+SELECT pinyin_match(['pi1', 'ping2', 'pu3']::PINYIN[], 'p * *')::VARCHAR,
+       pinyin_match(['pi1', 'ping2', 'pu3']::PINYIN[], 'p **')::VARCHAR,
+       pinyin_match(['zhong1', 'guo2']::PINYIN[], 'p **')::VARCHAR,
+       pinyin_match(['pi1', 'guo2']::PINYIN[], 'p ?ang')::VARCHAR;
+----
+true	true	false	false
+
+query TT
+SELECT pinyin_match(['pi1', 'shang3']::PINYIN[], 'p 3')::VARCHAR,
+       pinyin_match(['pi1', 'shang3']::PINYIN[], 'p 1')::VARCHAR;
+----
+true	false
+
+# An empty pattern is a phrase of no syllables, so it matches an empty list and
+# nothing else.
+query TTT
+SELECT pinyin_match([]::PINYIN[], '')::VARCHAR,
+       pinyin_match([]::PINYIN[], '**')::VARCHAR,
+       pinyin_match([]::PINYIN[], '*')::VARCHAR;
+----
+true	true	false
+
+# A list column binds the same way, and a phrase of three is reachable.
+query TI
+SELECT s::VARCHAR, pinyin_match(s, 'zhong ** guo')
+FROM (VALUES (['zhong1']::PINYIN[]), (['zhong1', 'guo2']::PINYIN[]),
+             (['zhong1', 'ren2', 'min2', 'guo2']::PINYIN[]),
+             (['guo2', 'zhong1']::PINYIN[])) t(s)
+----
+[zhōng]	false
+[zhōng, guó]	true
+[zhōng, rén, mín, guó]	true
+[guó, zhōng]	false
+
+# A NULL pattern names nothing; a NULL list has no syllables; a NULL *element*
+# leaves a hole where a syllable should be. All three give NULL, not false.
+query TTT
+SELECT pinyin_match(['zhong1']::PINYIN[], NULL::VARCHAR)::VARCHAR,
+       pinyin_match(NULL::PINYIN[], '**')::VARCHAR,
+       pinyin_match(['zhong1', NULL]::PINYIN[], '**')::VARCHAR;
+----
+NULL	NULL	NULL
+
+# A pattern that names nothing legal raises here too, rather than quietly
+# matching nothing.
+statement error
+SELECT pinyin_match(['zhong1']::PINYIN[], 'zzz');
+----
+Invalid pinyin pattern: 'zzz'
+
+statement error
+SELECT pinyin_match(['zhong1', 'guo2']::PINYIN[], 'zhong zzz');
+----
+Invalid pinyin pattern: 'zhong zzz'
+
+# `**` says "more than one syllable can stand here", which a single PINYIN
+# value can never satisfy, so it is not a one-syllable pattern.
+statement error
+SELECT pinyin_match('zhong1'::PINYIN, '**');
+----
+Invalid pinyin pattern: '**'
+
+# Filters span multiple DataChunks (STANDARD_VECTOR_SIZE = 2048). Every list is
+# two syllables long, so `p **` depends only on the first, and `p * *` on the
+# length.
+query IIII
+SELECT count(*),
+       count(*) FILTER (WHERE pinyin_match(s, 'p **')),
+       count(*) FILTER (WHERE pinyin_match(s, '* *')),
+       count(*) FILTER (WHERE pinyin_match(s, '** shang'))
+FROM (SELECT list_value(CASE WHEN i % 3 = 0 THEN 'pīng' ELSE 'shǎng' END::PINYIN,
+                       CASE WHEN i % 2 = 0 THEN 'shang3' ELSE 'guo2' END::PINYIN) AS s
+      FROM range(3000) t(i));
+----
+3000	1000	3000	1500
+
+# --- nulls ------------------------------------------------------------------
+
+query TT
+SELECT pinyin_match(NULL::PINYIN, 'p?')::VARCHAR,
+       pinyin_match('zhong1'::PINYIN, NULL::VARCHAR)::VARCHAR;
+----
+NULL	NULL
+
+# A NULL survives VARCHAR -> PINYIN -> VARCHAR in both directions.
+query TT
+SELECT s::PINYIN::VARCHAR, typeof(s::PINYIN)
+FROM (VALUES (NULL::VARCHAR), ('zhong1')) v(s)
+ORDER BY s::PINYIN::USMALLINT NULLS FIRST;
+----
+NULL	PINYIN
+zhōng	PINYIN
+
+# --- invalid patterns -------------------------------------------------------
+
+# A pattern that names nothing legal is a typo far more often than it is an
+# intent to match nothing, so it raises rather than quietly matching nothing.
+statement error
+SELECT pinyin_match('zhong1'::PINYIN, 'zzz');
+----
+Invalid pinyin pattern: 'zzz'
+
+statement error
+SELECT pinyin_match('zhong1'::PINYIN, 'qqqq');
+----
+Invalid pinyin pattern: 'qqqq'
+
+# A bare 声母 is a valid pattern, but a bare 声母 is not a valid *syllable*.
+query T
+SELECT pinyin_match('pīng'::PINYIN, 'p')::VARCHAR;
+----
+true
+
+statement error
+SELECT 'p'::PINYIN;
+----
+Invalid pinyin syllable: 'p'
+
+# --- table round trip and chunk boundaries ----------------------------------
+
+statement ok
+CREATE TABLE pinyin_t(s PINYIN)
+
+statement ok
+INSERT INTO pinyin_t VALUES ('zhōng'), ('pīng'), ('pá'), (NULL)
+
+query TI
+SELECT s::VARCHAR, s::USMALLINT FROM pinyin_t ORDER BY s::USMALLINT;
+----
+pá	942
+pīng	5774
+zhōng	36502
+NULL	NULL
+
+query I
+SELECT count(*) FROM pinyin_t WHERE pinyin_match(s, 'p');
+----
+2
+
+# Filters span multiple DataChunks (STANDARD_VECTOR_SIZE = 2048). `pīng` is
+# 阴平 and `shǎng` is 上声, so the 声母 and 声调 filters disagree.
+query IIII
+SELECT count(*),
+       count(*) FILTER (WHERE pinyin_match(s, 'p')),
+       count(*) FILTER (WHERE pinyin_match(s, '?1')),
+       count(*) FILTER (WHERE pinyin_match(s, '?3'))
+FROM (SELECT CASE WHEN i % 3 = 0 THEN 'pīng' ELSE 'shǎng' END::PINYIN AS s
+      FROM range(3000) t(i));
+----
+3000	1000	1000	2000
