@@ -224,6 +224,13 @@ A `USMALLINT` column does **not** bind implicitly — an arbitrary integer has n
 been parsed into a syllable, so it takes an explicit cast. An integer literal
 folds at bind time and does bind.
 
+A `USMALLINT[]` column *does* bind. Parquet and every other round trip keep the
+storage but drop the alias, so a `PINYIN[]` written out and read back is a
+`USMALLINT[]`; an implicit `USMALLINT[] -> PINYIN[]` cast re-tags it so such a
+column still reaches the array overload without a hand-written `::PINYIN[]`. The
+cast moves nothing — the u16s are untouched — and it is registered only at the
+list level, so the scalar rule above is unaffected.
+
 NULL on either side gives NULL, as does a NULL *element* inside the list: there
 is no syllable there to have matched. A pattern that names nothing legal raises
 `Invalid pinyin pattern` rather than quietly matching nothing, and a value that

@@ -5,6 +5,7 @@ use duckdb::{ffi, ffi::duckdb_string_t, types::DuckString};
 use std::{
     error::Error,
     ffi::{CStr, CString},
+    slice,
 };
 
 /// The SQL name of the function.
@@ -16,6 +17,15 @@ const MATCH_FUNCTION_NAME: &str = "pinyin_match";
 /// pinyin_match(PINYIN,   VARCHAR) -> BOOLEAN   one syllable
 /// pinyin_match(PINYIN[], VARCHAR) -> BOOLEAN   a sequence of them
 /// ```
+///
+/// A bare `USMALLINT[]` reaches the second overload through the implicit
+/// `USMALLINT[] -> PINYIN[]` cast registered in `lib.rs`, so there is no third
+/// overload for it — and there must not be one. Overload resolution asks each
+/// candidate for the cost of casting the argument to its parameter, and that
+/// cast is registered at cost 0, the same as the exact match `USMALLINT[] ->
+/// USMALLINT[]` would be. Two candidates at equal cost is an ambiguity error, so
+/// spelling the same overload out a second time would not widen what binds — it
+/// would make the call stop binding at all.
 ///
 /// These go through the C API rather than the `duckdb` crate's `vscalar`
 /// helper, because a parameter has to be the `PINYIN` alias itself. The crate's
@@ -122,6 +132,24 @@ unsafe fn register_one(
     Ok(())
 }
 
+/// Read one validity bit out of a vector's null mask.
+///
+/// DuckDB's own header calls `duckdb_validity_row_is_valid` "the (slower)" way
+/// to ask this, and as a loadable extension every call to it is an indirect one
+/// through the API table on top of that. The bit is nothing more than
+/// `mask[row / 64] & (1 << (row % 64))`, and a vector holding no nulls carries a
+/// *null* mask meaning "all valid" — so the usual case is one pointer test, and
+/// the rest inlines into the caller's loop instead of calling out of the
+/// extension a few million times.
+///
+/// # Safety
+///
+/// `validity` must be null, or a mask covering at least `row + 1` rows.
+#[inline(always)]
+unsafe fn row_is_valid(validity: *const u64, row: usize) -> bool {
+    validity.is_null() || unsafe { *validity.add(row >> 6) & (1u64 << (row & 63)) != 0 }
+}
+
 /// Match every row of the chunk and write the answers out.
 ///
 /// DuckDB flattens the input vectors before calling a plain scalar function, so
@@ -159,10 +187,7 @@ unsafe extern "C" fn pinyin_match_function(
     let mut cached: Option<(Vec<u8>, Pattern)> = None;
 
     for i in 0..count {
-        let valid = unsafe {
-            ffi::duckdb_validity_row_is_valid(value_validity, i as ffi::idx_t)
-                && ffi::duckdb_validity_row_is_valid(pattern_validity, i as ffi::idx_t)
-        };
+        let valid = unsafe { row_is_valid(value_validity, i) && row_is_valid(pattern_validity, i) };
         if !valid {
             unsafe {
                 ffi::duckdb_validity_set_row_validity(out_validity, i as ffi::idx_t, false);
@@ -246,14 +271,12 @@ unsafe extern "C" fn pinyin_match_array_function(
     let mut cached_elems: Vec<pinyin::Elem> = Vec::new();
     let mut have_cached = false;
 
-    // Reused across rows so that a long list does not allocate per row.
+    // Only the null-bearing path below stages a row's syllables here; a row
+    // with none needs no copy at all. Reused across rows either way.
     let mut syllables: Vec<u16> = Vec::new();
 
     for i in 0..count {
-        let valid = unsafe {
-            ffi::duckdb_validity_row_is_valid(list_validity, i as ffi::idx_t)
-                && ffi::duckdb_validity_row_is_valid(pattern_validity, i as ffi::idx_t)
-        };
+        let valid = unsafe { row_is_valid(list_validity, i) && row_is_valid(pattern_validity, i) };
         if !valid {
             unsafe {
                 ffi::duckdb_validity_set_row_validity(out_validity, i as ffi::idx_t, false);
@@ -293,30 +316,38 @@ unsafe extern "C" fn pinyin_match_array_function(
             }
         }
 
-        // A null anywhere in the list makes the whole answer null: there is no
-        // syllable there to have matched or not matched.
         let entry = unsafe { *entries.add(i) };
         let start = entry.offset as usize;
-        let end = start + entry.length as usize;
+        let length = entry.length as usize;
 
-        syllables.clear();
-        let mut null_element = false;
-        for j in start..end {
-            if !unsafe { ffi::duckdb_validity_row_is_valid(child_validity, j as ffi::idx_t) } {
-                null_element = true;
-                break;
+        // A null anywhere in the list makes the whole answer null: there is no
+        // syllable there to have matched or not matched. A child vector holding
+        // no nulls carries a null mask, and then the row's syllables are already
+        // contiguous in the child — so the common case matches straight off that
+        // slice, with no staging copy and no per-element validity test.
+        let matched = if child_validity.is_null() {
+            let row = unsafe { slice::from_raw_parts(child_values.add(start), length) };
+            pinyin::match_sequence(&cached_elems, row)
+        } else {
+            syllables.clear();
+            let mut null_element = false;
+            for j in start..start + length {
+                if !unsafe { row_is_valid(child_validity, j) } {
+                    null_element = true;
+                    break;
+                }
+                syllables.push(unsafe { *child_values.add(j) });
             }
-            syllables.push(unsafe { *child_values.add(j) });
-        }
-
-        if null_element {
-            unsafe {
-                ffi::duckdb_validity_set_row_validity(out_validity, i as ffi::idx_t, false);
-                *answers.add(i) = false;
+            if null_element {
+                unsafe {
+                    ffi::duckdb_validity_set_row_validity(out_validity, i as ffi::idx_t, false);
+                    *answers.add(i) = false;
+                }
+                continue;
             }
-            continue;
-        }
+            pinyin::match_sequence(&cached_elems, &syllables)
+        };
 
-        unsafe { *answers.add(i) = pinyin::match_sequence(&cached_elems, &syllables) };
+        unsafe { *answers.add(i) = matched };
     }
 }

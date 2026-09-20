@@ -137,6 +137,27 @@ SELECT 'zhong1'::PINYIN + 1, length('zhong1'::PINYIN::VARCHAR);
 ----
 36503	5
 
+# A PINYIN[] does not survive a round trip as a PINYIN[]: a table column, a
+# parquet file, any COPY keeps the storage but drops the alias, so the value
+# comes back as USMALLINT[]. The implicit USMALLINT[] -> PINYIN[] cast re-tags
+# it, which is what lets such a column still reach the array overload.
+statement ok
+CREATE TABLE retagged(p USMALLINT[])
+
+statement ok
+INSERT INTO retagged VALUES (['zhong1', 'guo2']::PINYIN[]::USMALLINT[])
+
+query TI
+SELECT typeof(p), pinyin_match(p, 'zhong guo') FROM retagged;
+----
+USMALLINT[]	true
+
+# Re-tagging moves nothing — the u16s are untouched, so it renders as before.
+query T
+SELECT p::PINYIN[]::VARCHAR FROM retagged;
+----
+[zhōng, guó]
+
 # --- pinyin_match -----------------------------------------------------------
 
 # A pattern is a syllable with any part replaced by a wildcard, and a part that

@@ -187,10 +187,19 @@ unsafe fn register_casts(con: ffi::duckdb_connection, name: &CStr) -> Result<(),
     // different types to the cast registry.
     unsafe { ffi::duckdb_logical_type_set_alias(pinyin, name.as_ptr()) };
 
+    // The same pair one level up, for the array overload.
+    let mut list_u16 = unsafe { ffi::duckdb_create_list_type(u16_) };
+    let mut list_pinyin = unsafe { ffi::duckdb_create_list_type(pinyin) };
+
     let mut to_pinyin = unsafe { ffi::duckdb_create_cast_function() };
     let mut from_pinyin = unsafe { ffi::duckdb_create_cast_function() };
     let mut to_u16 = unsafe { ffi::duckdb_create_cast_function() };
-    if to_pinyin.is_null() || from_pinyin.is_null() || to_u16.is_null() {
+    let mut to_pinyin_list = unsafe { ffi::duckdb_create_cast_function() };
+    if list_u16.is_null() || list_pinyin.is_null() {
+        return Err("could not create the LIST cast logical types".into());
+    }
+    if to_pinyin.is_null() || from_pinyin.is_null() || to_u16.is_null() || to_pinyin_list.is_null()
+    {
         return Err("could not create the cast functions".into());
     }
 
@@ -221,18 +230,32 @@ unsafe fn register_casts(con: ffi::duckdb_connection, name: &CStr) -> Result<(),
         ffi::duckdb_cast_function_set_target_type(to_u16, u16_);
         ffi::duckdb_cast_function_set_function(to_u16, Some(cast_untag_pinyin));
         ffi::duckdb_cast_function_set_implicit_cast_cost(to_u16, 0);
+
+        // The same thing one level up. Parquet — and every other round trip —
+        // keeps the storage but drops the alias, so a `PINYIN[]` column read
+        // back is a `USMALLINT[]`, and without this the array overload of
+        // `pinyin_match` could no longer bind it. The two layouts are
+        // identical, so the cast moves nothing and only re-tags the elements.
+        ffi::duckdb_cast_function_set_source_type(to_pinyin_list, list_u16);
+        ffi::duckdb_cast_function_set_target_type(to_pinyin_list, list_pinyin);
+        ffi::duckdb_cast_function_set_function(to_pinyin_list, Some(cast_retag_pinyin_list));
+        ffi::duckdb_cast_function_set_implicit_cast_cost(to_pinyin_list, 0);
     }
 
     let results = [
         unsafe { ffi::duckdb_register_cast_function(con, to_pinyin) },
         unsafe { ffi::duckdb_register_cast_function(con, from_pinyin) },
         unsafe { ffi::duckdb_register_cast_function(con, to_u16) },
+        unsafe { ffi::duckdb_register_cast_function(con, to_pinyin_list) },
     ];
 
     unsafe {
         ffi::duckdb_destroy_cast_function(&mut to_pinyin);
         ffi::duckdb_destroy_cast_function(&mut from_pinyin);
         ffi::duckdb_destroy_cast_function(&mut to_u16);
+        ffi::duckdb_destroy_cast_function(&mut to_pinyin_list);
+        ffi::duckdb_destroy_logical_type(&mut list_u16);
+        ffi::duckdb_destroy_logical_type(&mut list_pinyin);
         ffi::duckdb_destroy_logical_type(&mut varchar);
         ffi::duckdb_destroy_logical_type(&mut u16_);
         ffi::duckdb_destroy_logical_type(&mut pinyin);
@@ -281,6 +304,25 @@ unsafe extern "C" fn cast_untag_pinyin(
             }
         }
     }
+    true
+}
+
+/// `USMALLINT[] -> PINYIN[]`.
+///
+/// Both sides are the same `LIST(USMALLINT)` layout, so no element moves: the
+/// output is pointed straight at the input's data, and only the element type's
+/// alias differs.
+///
+/// # Safety
+///
+/// Called by DuckDB with vectors of the types registered above.
+unsafe extern "C" fn cast_retag_pinyin_list(
+    _info: ffi::duckdb_function_info,
+    _count: ffi::idx_t,
+    input: ffi::duckdb_vector,
+    output: ffi::duckdb_vector,
+) -> bool {
+    unsafe { ffi::duckdb_vector_reference_vector(output, input) };
     true
 }
 
