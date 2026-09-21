@@ -5,7 +5,7 @@ use duckdb::{ffi, ffi::duckdb_string_t, types::DuckString};
 use std::{
     error::Error,
     ffi::{CStr, CString},
-    slice,
+    ptr, slice,
 };
 
 /// The SQL name of the function.
@@ -150,6 +150,30 @@ unsafe fn row_is_valid(validity: *const u64, row: usize) -> bool {
     validity.is_null() || unsafe { *validity.add(row >> 6) & (1u64 << (row & 63)) != 0 }
 }
 
+/// The width [`raw_string_bits`] reads, and the only thing making its comparison
+/// whole-value rather than a prefix.
+const _: () = assert!(std::mem::size_of::<duckdb_string_t>() == 16);
+
+/// Read a `duckdb_string_t` as one integer, so that two of them can be compared
+/// without decoding either.
+///
+/// The struct is self-describing, which is what makes the comparison mean what
+/// it looks like it means: a string of 12 bytes or fewer keeps its characters
+/// inline, and a longer one keeps its length and pointer in the same 16 bytes.
+/// Either way equal bits imply the same string — a pointer that agrees has to
+/// point at the same bytes. The converse does not hold, so a caller that sees
+/// differing bits still has to compare the text itself before concluding
+/// anything.
+///
+/// # Safety
+///
+/// `patterns` must point at at least `row + 1` initialised `duckdb_string_t`,
+/// which is what a flattened `VARCHAR` vector is.
+#[inline(always)]
+unsafe fn raw_string_bits(patterns: *const duckdb_string_t, row: usize) -> u128 {
+    unsafe { ptr::read_unaligned(patterns.add(row).cast::<u128>()) }
+}
+
 /// Match every row of the chunk and write the answers out.
 ///
 /// DuckDB flattens the input vectors before calling a plain scalar function, so
@@ -184,7 +208,18 @@ unsafe extern "C" fn pinyin_match_function(
     // expensive half of the work, so remember the last one. Where the rows
     // disagree this is one recompile per distinct pattern, which is what a fresh
     // compile would have cost anyway.
-    let mut cached: Option<(Vec<u8>, Pattern)> = None;
+    //
+    // Whether the pattern is the one already in hand is decided on the raw bits
+    // of the `duckdb_string_t`, not on the text: `DuckString::as_str` is a
+    // `from_utf8_lossy` over `duckdb_string_t_length` and `duckdb_string_t_data`,
+    // two calls out through the C API table, and paying that on every row to
+    // rediscover that a literal has not changed was most of what this function
+    // cost. Equal bits mean equal strings; differing bits mean only "look
+    // closer", which is what the text comparison below is for.
+    let mut cached_bits = 0u128;
+    let mut cached_key: Vec<u8> = Vec::new();
+    let mut cached = Pattern::Never;
+    let mut have_cached = false;
 
     for i in 0..count {
         let valid = unsafe { row_is_valid(value_validity, i) && row_is_valid(pattern_validity, i) };
@@ -196,12 +231,15 @@ unsafe extern "C" fn pinyin_match_function(
             continue;
         }
 
-        let mut raw = unsafe { *raw_patterns.add(i) };
-        let text = DuckString::new(&mut raw).as_str();
+        let bits = unsafe { raw_string_bits(raw_patterns, i) };
+        if !have_cached || bits != cached_bits {
+            let mut raw = unsafe { *raw_patterns.add(i) };
+            let text = DuckString::new(&mut raw).as_str();
 
-        let pattern = match &cached {
-            Some((key, pattern)) if key.as_slice() == text.as_bytes() => *pattern,
-            _ => {
+            // A row holding the same pattern stored somewhere else — a VARCHAR
+            // column rather than a folded literal — still reuses the compiled
+            // form, and only a genuinely new pattern is worth compiling.
+            if !have_cached || cached_key.as_slice() != text.as_bytes() {
                 let pattern = pinyin::compile_pattern(&text);
                 if pattern == Pattern::Never {
                     // A pattern that names nothing legal is a typo far more
@@ -220,12 +258,15 @@ unsafe extern "C" fn pinyin_match_function(
                     }
                     return;
                 }
-                cached = Some((text.as_bytes().to_vec(), pattern));
-                pattern
+                cached_key.clear();
+                cached_key.extend_from_slice(text.as_bytes());
+                cached = pattern;
+                have_cached = true;
             }
-        };
+            cached_bits = bits;
+        }
 
-        unsafe { *answers.add(i) = pattern.matches(*values.add(i)) };
+        unsafe { *answers.add(i) = cached.matches(*values.add(i)) };
     }
 }
 
@@ -264,9 +305,15 @@ unsafe extern "C" fn pinyin_match_array_function(
     let out_validity = unsafe { ffi::duckdb_vector_get_validity(output) };
 
     // The last compiled pattern, kept so that a query repeating one literal does
-    // not recompile it per row. Held as two pieces rather than an `Option` so
-    // that the comparison below borrows nothing that the update in the `None`
-    // arm would have to fight with.
+    // not recompile it per row. Held as pieces rather than an `Option` so that
+    // the comparison below borrows nothing that the update in the `None` arm
+    // would have to fight with.
+    //
+    // As in the one-syllable overload, the cheap "is this still the same
+    // pattern" test is the raw bits of the `duckdb_string_t` — decoding costs
+    // two calls out through the C API table plus a UTF-8 scan, none of which is
+    // worth paying per row to rediscover an unchanged literal.
+    let mut cached_bits = 0u128;
     let mut cached_key: Vec<u8> = Vec::new();
     let mut cached_elems: Vec<pinyin::Elem> = Vec::new();
     let mut have_cached = false;
@@ -285,35 +332,39 @@ unsafe extern "C" fn pinyin_match_array_function(
             continue;
         }
 
-        let mut raw = unsafe { *raw_patterns.add(i) };
-        let text = DuckString::new(&mut raw).as_str();
+        let bits = unsafe { raw_string_bits(raw_patterns, i) };
+        if !have_cached || bits != cached_bits {
+            let mut raw = unsafe { *raw_patterns.add(i) };
+            let text = DuckString::new(&mut raw).as_str();
 
-        if !have_cached || cached_key.as_slice() != text.as_bytes() {
-            match pinyin::compile_sequence(&text) {
-                Some(elems) => {
-                    cached_key.clear();
-                    cached_key.extend_from_slice(text.as_bytes());
-                    cached_elems = elems;
-                    have_cached = true;
-                }
-                None => {
-                    // Same reasoning as the one-syllable overload: a pattern that
-                    // names nothing legal is a typo, so say so rather than
-                    // quietly returning false for every row.
-                    match CString::new(format!("Invalid pinyin pattern: '{text}'")) {
-                        Ok(message) => unsafe {
-                            ffi::duckdb_scalar_function_set_error(info, message.as_ptr())
-                        },
-                        Err(_) => unsafe {
-                            ffi::duckdb_scalar_function_set_error(
-                                info,
-                                c"invalid pinyin pattern".as_ptr(),
-                            )
-                        },
+            if !have_cached || cached_key.as_slice() != text.as_bytes() {
+                match pinyin::compile_sequence(&text) {
+                    Some(elems) => {
+                        cached_key.clear();
+                        cached_key.extend_from_slice(text.as_bytes());
+                        cached_elems = elems;
+                        have_cached = true;
                     }
-                    return;
+                    None => {
+                        // Same reasoning as the one-syllable overload: a pattern
+                        // that names nothing legal is a typo, so say so rather
+                        // than quietly returning false for every row.
+                        match CString::new(format!("Invalid pinyin pattern: '{text}'")) {
+                            Ok(message) => unsafe {
+                                ffi::duckdb_scalar_function_set_error(info, message.as_ptr())
+                            },
+                            Err(_) => unsafe {
+                                ffi::duckdb_scalar_function_set_error(
+                                    info,
+                                    c"invalid pinyin pattern".as_ptr(),
+                                )
+                            },
+                        }
+                        return;
+                    }
                 }
             }
+            cached_bits = bits;
         }
 
         let entry = unsafe { *entries.add(i) };

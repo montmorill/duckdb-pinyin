@@ -352,6 +352,53 @@ FROM (VALUES (['zhong1']::PINYIN[]), (['zhong1', 'guo2']::PINYIN[]),
 [zhōng, rén, mín, guó]	true
 [guó, zhōng]	false
 
+# A pattern is usually a literal, but it can also be a column, and then it
+# differs from row to row — so the compiled pattern in hand is not simply "the
+# one from the last row". A row whose pattern repeats an earlier one, after a
+# different pattern has come in between, still has to be matched against that
+# pattern: the fourth line here is the one that catches a cache keyed on
+# anything less than the pattern itself.
+query TII
+SELECT pat, pinyin_match(p, pat), pinyin_match(p, 'zhong guo')
+FROM (VALUES (['zhong1', 'guo2']::PINYIN[], 'zhong guo'),
+             (['zhong1', 'guo2']::PINYIN[], 'zhong **'),
+             (['zhong1', 'guo2']::PINYIN[], 'guo **'),
+             (['zhong1', 'guo2']::PINYIN[], 'zhong guo'),
+             (['zhong1', 'guo2']::PINYIN[], '**')) t(p, pat);
+----
+zhong guo	true	true
+zhong **	true	true
+guo **	false	true
+zhong guo	true	true
+**	true	true
+
+# Whether the pattern changed is decided without decoding the string, which is
+# only sound because a VARCHAR of more than 12 bytes carries its length and
+# pointer in the same 16 bytes a short one carries its text. These three are 20
+# bytes each and differ in the last byte alone, so they agree on everything that
+# comparison looks at; only the text tells them apart.
+query TII
+SELECT pat, pinyin_match(p, pat), pinyin_match(p, 'zhong1 hua2 ren2 min2')
+FROM (VALUES (['zhong1', 'hua2', 'ren2', 'min2']::PINYIN[], 'zhong1 hua2 ren2 min2'),
+             (['zhong1', 'hua2', 'ren2', 'min2']::PINYIN[], 'zhong1 hua2 ren2 min3'),
+             (['zhong1', 'hua2', 'ren2', 'min2']::PINYIN[], 'zhong1 hua2 ren2 min4'),
+             (['zhong1', 'hua2', 'ren2', 'min2']::PINYIN[], 'zhong1 hua2 ren2 min2')) t(p, pat);
+----
+zhong1 hua2 ren2 min2	true	true
+zhong1 hua2 ren2 min3	false	true
+zhong1 hua2 ren2 min4	false	true
+zhong1 hua2 ren2 min2	true	true
+
+# The one-syllable overload reads its pattern the same way.
+query TII
+SELECT pat, pinyin_match(v, pat), pinyin_match(v, 'zhong')
+FROM (VALUES ('zhong1'::PINYIN, 'zhong'), ('zhong1'::PINYIN, 'guo'),
+             ('zhong1'::PINYIN, 'zhong')) t(v, pat);
+----
+zhong	true	true
+guo	false	true
+zhong	true	true
+
 # A NULL pattern names nothing; a NULL list has no syllables; a NULL *element*
 # leaves a hole where a syllable should be. All three give NULL, not false.
 query TTT
