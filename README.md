@@ -1,4 +1,4 @@
-# duck-pinyin
+# duckdb-pinyin
 
 A DuckDB extension that adds a **`PINYIN`** column type and **`pinyin_match`**,
 for filtering Chinese text by how it sounds rather than how it is written.
