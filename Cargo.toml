@@ -1,5 +1,5 @@
 [package]
-name = "rusty_quack"
+name = "pinyin"
 version = "0.1.0"
 edition = "2024"
 
@@ -10,14 +10,10 @@ crate-type = ["cdylib"]
 lto = true
 strip = true
 
-[[example]]
-# crate-type can't be (at the moment) be overriden for specific targets
-# src/wasm_lib.rs forwards to src/lib.rs so that we can change from cdylib
-# (that is needed while compiling natively) to staticlib (needed since the
-# actual linking will be done via emcc
-name = "rusty_quack"
-path = "src/wasm_lib.rs"
-crate-type = ["staticlib"]
-
 [dependencies]
-duckdb = { version = "~1.10505.0", features = ["loadable-extension", "vscalar"] }
+# `loadable-extension` is what lets the crate register into a DuckDB it was not
+# linked against. It brings in `vtab` with it, which is where `types` (and so
+# `DuckString`) lives. The `vscalar` feature is deliberately absent: it exists
+# for the `VScalar` trait, which builds its argument marshalling on the Arrow
+# C data interface, and every function here reads DuckDB's vectors directly.
+duckdb = { version = "~1.10505.0", features = ["loadable-extension"] }

@@ -1,109 +1,13 @@
-use duckdb::{
-    Connection, Result,
-    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-    ffi,
-    ffi::duckdb_string_t,
-    types::DuckString,
-    vscalar::{ScalarFunctionSignature, VScalar},
-    vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, arrow::WritableVector},
-};
+use duckdb::{Result, ffi, ffi::duckdb_string_t, types::DuckString};
 use std::{
     error::Error,
     ffi::{CStr, CString},
     ptr,
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 mod functions;
 mod pinyin;
 mod pinyin_data;
-
-// --- the stock template's echo function and table function ------------------
-
-struct EchoScalar;
-
-impl VScalar for EchoScalar {
-    type State = ();
-
-    fn invoke(
-        _state: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let input_vec = input.flat_vector(0);
-        let values = unsafe { input_vec.as_slice_with_len::<duckdb_string_t>(input.len()) };
-        let mut output = output.flat_vector();
-
-        for (i, value) in values.iter().enumerate() {
-            if input_vec.row_is_null(i as u64) {
-                output.set_null(i);
-                continue;
-            }
-
-            let mut value = *value;
-            let s = DuckString::new(&mut value).as_str();
-            output.insert(i, format!("🐤 {s} 🦀 {s}").as_str());
-        }
-        Ok(())
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![LogicalTypeId::Varchar.into()],
-            LogicalTypeId::Varchar.into(),
-        )]
-    }
-}
-
-#[repr(C)]
-struct HelloBindData {
-    name: String,
-}
-
-#[repr(C)]
-struct HelloInitData {
-    done: AtomicBool,
-}
-
-struct HelloVTab;
-
-impl VTab for HelloVTab {
-    type InitData = HelloInitData;
-    type BindData = HelloBindData;
-
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        bind.add_result_column("column0", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        let name = bind.get_parameter(0).to_string();
-        Ok(HelloBindData { name })
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        Ok(HelloInitData {
-            done: AtomicBool::new(false),
-        })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let init_data = func.get_init_data();
-        let bind_data = func.get_bind_data();
-        if init_data.done.swap(true, Ordering::Relaxed) {
-            output.set_len(0);
-        } else {
-            let vector = output.flat_vector(0);
-            let result = CString::new(format!("Rusty Quack {} 🐥", bind_data.name))?;
-            vector.insert(0, result);
-            output.set_len(1);
-        }
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
-    }
-}
 
 // --- the PINYIN column type -------------------------------------------------
 
@@ -455,10 +359,6 @@ unsafe fn extension_entrypoint(
 
         register_pinyin_type(db)?;
 
-        let con = Connection::open_from_raw(db.cast())?;
-        con.register_scalar_function::<EchoScalar>("rusty_echo")?;
-        con.register_table_function::<HelloVTab>("rusty_quack")?;
-
         Ok(true)
     }
 }
@@ -467,7 +367,7 @@ unsafe fn extension_entrypoint(
 ///
 /// The entrypoint DuckDB calls when loading this extension.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rusty_quack_init_c_api(
+pub unsafe extern "C" fn pinyin_init_c_api(
     info: ffi::duckdb_extension_info,
     access: *const ffi::duckdb_extension_access,
 ) -> bool {

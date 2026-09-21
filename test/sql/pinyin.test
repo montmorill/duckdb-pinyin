@@ -1,6 +1,6 @@
 # name: test/sql/pinyin.test
 # description: test the PINYIN column type and pinyin_match
-# group: [quack]
+# group: [pinyin]
 
 # Before we load the extension, neither the type nor the function exists.
 statement error
@@ -13,7 +13,7 @@ SELECT pinyin_match('zhong1'::PINYIN, 'p?');
 ----
 Catalog Error
 
-require rusty_quack
+require pinyin
 
 # --- the type itself --------------------------------------------------------
 

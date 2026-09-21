@@ -1,89 +1,56 @@
-# DuckDB Rust extension template
-This is an **experimental** template for Rust based extensions based on the C Extension API of DuckDB. The goal is to
-turn this eventually into a stable basis for pure-Rust DuckDB extensions that can be submitted to the Community extensions
-repository
+# pinyin
 
-Features:
-- No DuckDB build required
-- No C++ or C code required
-- CI/CD chain preconfigured
-- (Coming soon) Works with community extensions
+A DuckDB extension that adds a **`PINYIN`** column type and **`pinyin_match`**,
+for filtering Chinese text by how it sounds rather than how it is written.
 
-## Cloning
+`PINYIN` is an alias of `USMALLINT`, so a syllable costs the two bytes an integer
+already cost, and there is no separate storage path to keep working. Filtering
+is one masked compare per value: the 声母, 韵母 and 声调 are separate bit fields,
+so a pattern like `p?` or `?ang` compiles to a mask and a constant.
 
-Clone the repo with submodules
-
-```shell
-git clone --recurse-submodules <repo>
-```
-
-## Dependencies
-In principle, these extensions can be compiled with the Rust toolchain alone. However, this template relies on some additional
-tooling to make life a little easier and to be able to share CI/CD infrastructure with extension templates for other languages:
-
-- Python3
-- Python3-venv
-- [Make](https://www.gnu.org/software/make)
-- Git
-
-Installing these dependencies will vary per platform:
-- For Linux, these come generally pre-installed or are available through the distro-specific package manager.
-- For MacOS, [homebrew](https://formulae.brew.sh/).
-- For Windows, [chocolatey](https://community.chocolatey.org/).
+- No DuckDB build required — built against the C extension API
+- No C or C++ — pure Rust
+- No hanzi table: `VARCHAR -> PINYIN` parses pinyin, not characters
 
 ## Building
-After installing the dependencies, building is a two-step process. Firstly run:
+
+Building is a two-step process. First:
+
 ```shell
 make configure
 ```
-This will ensure a Python venv is set up with DuckDB and DuckDB's test runner installed. Additionally, depending on configuration,
-DuckDB will be used to determine the correct platform for which you are compiling.
 
-Then, to build the extension run:
+This sets up a Python venv with DuckDB and its test runner, and works out the
+platform you are compiling for. It needs Python 3 with `venv`, `make`, and git;
+the submodule has to be present, so clone with `--recurse-submodules`.
+
+Then:
+
 ```shell
-make debug
+make debug      # or `make release` for an optimized build
 ```
-This delegates the build process to cargo, which will produce a shared library in `target/debug/<shared_lib_name>`. After this step,
-a script is run to transform the shared library into a loadable extension by appending a binary footer. The resulting extension is written
-to the `build/debug` directory.
 
-To create optimized release binaries, simply run `make release` instead.
+This delegates to cargo and turns the resulting shared library into a loadable
+extension by appending a binary footer, written to
+`build/debug/extension/pinyin/pinyin.duckdb_extension`.
 
-### Running the extension
-To run the extension code, start `duckdb` with `-unsigned` flag. This will allow you to load the local extension file.
+## Running it
+
+Local extensions have to be loaded unsigned:
 
 ```sh
 duckdb -unsigned
 ```
 
-After loading the extension by the file path, you can use the functions provided by the extension. This template registers
-the `rusty_echo()` scalar function and the `rusty_quack()` table function.
-
 ```sql
-LOAD './build/debug/extension/rusty_quack/rusty_quack.duckdb_extension';
-SELECT rusty_echo('Jane');
-```
+LOAD './build/release/extension/pinyin/pinyin.duckdb_extension';
 
-```
-┌─────────────────────┐
-│ rusty_echo('Jane')  │
-│       varchar       │
-├─────────────────────┤
-│ 🐤 Jane 🦀 Jane     │
-└─────────────────────┘
-```
+CREATE TABLE t(s PINYIN);
+INSERT INTO t VALUES ('zhong1'), ('guó'), ('shǎng'), (NULL);
 
-```sql
-SELECT * FROM rusty_quack('Jane');
-```
-
-```
-┌─────────────────────┐
-│       column0       │
-│       varchar       │
-├─────────────────────┤
-│ Rusty Quack Jane 🐥 │
-└─────────────────────┘
+-- 韵母 ang, 声母 and 声调 free
+SELECT s::VARCHAR, s::USMALLINT FROM t WHERE pinyin_match(s, '?ang');
+-- shǎng	34513
 ```
 
 ## The `PINYIN` column type
@@ -146,10 +113,29 @@ An array of syllables is just `LIST(PINYIN)`, so it comes for free — no separa
 type is registered. It has its own `pinyin_match` overload, below.
 
 ```sql
-SELECT ['zhong1', 'guo2']::PINYIN[];        -- [zhōng, guó]
-SELECT unnest(['zhong1', 'guo2']::PINYIN[]);
-SELECT list_filter(['zhong1', 'guo2', 'shǎng']::PINYIN[], lambda s: pinyin_match(s, 'zh'));
+SELECT ['zhong1', 'guo2']::PINYIN[]::VARCHAR;             -- [zhōng, guó]
+SELECT unnest(['zhong1', 'guo2']::PINYIN[])::VARCHAR;     -- zhōng, then guó
+SELECT list_filter(['zhong1', 'guo2', 'shǎng']::PINYIN[],
+                   lambda s: pinyin_match(s, 'zh'))::VARCHAR;   -- [zhōng]
 ```
+
+### Rendering takes an explicit cast
+
+`PINYIN -> VARCHAR` is registered **without** an implicit cost, so `SELECT s`
+prints the integer a `PINYIN` is stored as, and `'zhōng'` needs `s::VARCHAR`.
+That is deliberate: `PINYIN` is an alias of `USMALLINT`, so an implicit cast to
+`VARCHAR` would compete with DuckDB's own numeric one and could change how a
+plain `USMALLINT` renders. The cast is still there for `::` and for
+`TRY_CAST(... AS VARCHAR)`, and it is the inverse of the parse:
+
+```sql
+SELECT 'zhong1'::PINYIN::VARCHAR;    -- zhōng
+SELECT 'liu2'::PINYIN::VARCHAR;      -- liú    (tone mark on the o)
+SELECT 'zhong'::PINYIN::VARCHAR;     -- zhong  (no tone written, none shown)
+```
+
+Tone marks are placed by the 汉语拼音 rule, on the first of `a > o > e` and
+otherwise on the last vowel.
 
 ### `pinyin_match(PINYIN, VARCHAR) -> BOOLEAN`
 
@@ -251,7 +237,7 @@ Three things worth knowing:
   because it is the reference's glyph and would be the right spelling if erhua
   were ever added.
 
-### Where the table comes from
+## Where the table comes from
 
 `src/pinyin_data.rs` is generated and **must not be edited by hand**:
 
@@ -261,49 +247,37 @@ python tools/gen_pinyin_table.py tools/pinyin-data-0.15.0.txt src/pinyin_data.rs
 
 It is built from [`mozillazg/pinyin-data`](https://github.com/mozillazg/pinyin-data)
 (MIT), which supplies the *inventory* of 426 syllables. The bit layout and the
-orthography-to-phoneme split follow `WFLing-seaer/pinyinparser`. That repository
-carries no license, so no part of it is copied — only the encoding rules, which
-are reimplemented here. See `tools/gen_pinyin_table.py` for the rules themselves.
+orthography-to-phoneme split follow
+[`WFLing-seaer/pinyinparser`](https://github.com/WFLing-seaer/pinyinparser) —
+which carries no license, so no part of it is copied. Only the encoding rules
+are, reimplemented in `src/pinyin.rs`; `tools/gen_pinyin_table.py` states them.
 
 ## Testing
-This extension uses the DuckDB Python client for testing. This should be automatically installed in the `make configure` step.
-The tests themselves are written in the SQLLogicTest format, just like most of DuckDB's tests. A sample test can be found in
-`test/sql/<extension_name>.test`. To run the tests using the *debug* build:
+
+`test/sql/pinyin.test` is a SQLLogicTest, the same format DuckDB's own tests
+use, run through the DuckDB Python client that `make configure` installed.
 
 ```shell
-make test_debug
+make test_release     # or `make test_debug`
 ```
 
-or for the *release* build:
-```shell
-make test_release
-```
+The suite is the only spec for this extension, so it is written to be read. Its
+sections follow the order the type is described above — the type itself,
+encoding, rendering, casts, `pinyin_match`, what the first argument may be, the
+array overload, nulls, invalid patterns, the round trip through Parquet — and
+every block says what it is pinning down rather than just what it expects.
+
+`make test_*` does **not** rebuild — it runs whatever is already in
+`build/<profile>/`. Run `make debug` or `make release` first, or the suite
+tests a binary older than the source.
 
 ### Version switching
-Testing with different DuckDB versions is really simple:
 
-First, run
-```
+To test against a different DuckDB, throw away the configure step first:
+
+```shell
 make clean_all
-```
-to ensure the previous `make configure` step is deleted.
-
-Then, run
-```
 DUCKDB_TEST_VERSION=v1.3.2 make configure
-```
-to select a different duckdb version to test with
-
-Finally, build and test with
-```
 make debug
 make test_debug
 ```
-
-### Known issues
-This is a bit of a footgun, but the extensions produced by this template may (or may not) be broken on windows on python3.11
-with the following error on extension load:
-```shell
-IO Error: Extension '<name>.duckdb_extension' could not be loaded: The specified module could not be found
-```
-This was resolved by using python 3.12
