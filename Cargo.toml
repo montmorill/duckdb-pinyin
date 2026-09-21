@@ -10,6 +10,16 @@ crate-type = ["cdylib"]
 lto = true
 strip = true
 
+[[example]]
+# The wasm target needs a `staticlib` and native needs a `cdylib`, and
+# crate-type cannot be selected per target, so `src/wasm_lib.rs` re-compiles the
+# crate as this example. That shim is a plain `mod lib;`, which re-roots the
+# crate one directory down — see the `#[path]` block in `src/lib.rs` for what
+# keeps the submodules resolving to `src/*.rs` under both roots.
+name = "pinyin"
+path = "src/wasm_lib.rs"
+crate-type = ["staticlib"]
+
 [dependencies]
 # `loadable-extension` is what lets the crate register into a DuckDB it was not
 # linked against. It brings in `vtab` with it, which is where `types` (and so

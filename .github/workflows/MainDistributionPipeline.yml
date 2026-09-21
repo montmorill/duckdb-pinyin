@@ -21,10 +21,14 @@ jobs:
       ci_tools_version: v1.5-variegata
       extension_name: pinyin
       extra_toolchains: rust;python3
-      # The wasm builds compile `src/wasm_lib.rs`, whose `mod lib;` puts the
-      # crate root one directory down and so cannot see this crate's submodules
-      # — `cargo build --example pinyin` does not compile. They are off until
-      # that is reworked; there is no wasm toolchain here to verify a fix with.
-      # `linux_amd64_musl` is opt-in and so already off by default, but is named
-      # here so the intent survives a change to that default.
-      exclude_archs: 'linux_amd64_musl;wasm_mvp;wasm_eh;wasm_threads'
+      # The wasm archs are on. The template's `src/wasm_lib.rs` shim re-roots the
+      # crate one directory down, so `src/lib.rs`'s submodules only resolve under
+      # both roots because they carry `#[path]` — see that block.
+      #
+      # Worth knowing what this job does and does not check: it compiles, links
+      # and uploads the wasm artifact, and nothing loads it. A green run means it
+      # builds for wasm32-unknown-emscripten, not that it runs.
+      #
+      # `linux_amd64_musl` is opt-in and so already off by default; it is named
+      # anyway so the intent survives a change to that default.
+      exclude_archs: 'linux_amd64_musl'

@@ -33,7 +33,7 @@
 //! `0x80, 0xA0, 0xC0, 0xE0` for 阴平/阳平/上声/去声, so the top two bits
 //! separate the two classes in a single mask.
 
-use crate::pinyin_data::{FINALS, INITIALS, SPELLINGS, SYLLABLES};
+use super::pinyin_data::{FINALS, INITIALS, SPELLINGS, SYLLABLES};
 
 // --- field geometry --------------------------------------------------------
 

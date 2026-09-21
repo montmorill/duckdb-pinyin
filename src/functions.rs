@@ -1,6 +1,6 @@
 //! `pinyin_match`, the one SQL function over `PINYIN`.
 
-use crate::pinyin::{self, Pattern};
+use super::pinyin::{self, Pattern};
 use duckdb::{ffi, ffi::duckdb_string_t, types::DuckString};
 use std::{
     error::Error,

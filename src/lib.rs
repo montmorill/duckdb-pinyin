@@ -5,8 +5,20 @@ use std::{
     ptr,
 };
 
+// Each `mod` carries a `#[path]`, and the submodules refer to each other with
+// `super::` rather than `crate::`. Both are needed because this file is compiled
+// under two different crate roots. Natively it *is* the root; for the wasm build
+// `src/wasm_lib.rs` pulls it in as `mod lib`, so the wasm target can be a
+// staticlib while the native one stays a cdylib. Under that second shape this
+// file is `crate::lib`, so a plain `mod pinyin;` would look for
+// `src/lib/pinyin.rs` and `crate::pinyin` would name something else entirely.
+// `#[path]` is resolved against the directory this file sits in — `src/` either
+// way — and `super::` is this module — this file — either way.
+#[path = "functions.rs"]
 mod functions;
+#[path = "pinyin.rs"]
 mod pinyin;
+#[path = "pinyin_data.rs"]
 mod pinyin_data;
 
 // --- the PINYIN column type -------------------------------------------------

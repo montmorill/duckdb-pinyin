@@ -219,7 +219,10 @@ def main(path, dest):
            "//!",
            "//! The bit layout and the orthography-to-phoneme split follow",
            "//! `WFLing-seaer/pinyinparser`; see that script for the rules.",
-           "", "use crate::pinyin::{Final, Initial};", ""]
+           "//!",
+           "//! `super::` rather than `crate::` because this file is compiled under",
+           "//! two crate roots; see the `mod` block in `src/lib.rs`.",
+           "", "use super::pinyin::{Final, Initial};", ""]
 
     # No 声调 table: the seven 声调 values are written out as constants on
     # `Tone`, and `split_tone` maps a digit straight to one of them.

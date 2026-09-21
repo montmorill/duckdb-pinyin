@@ -6,8 +6,11 @@
 //!
 //! The bit layout and the orthography-to-phoneme split follow
 //! `WFLing-seaer/pinyinparser`; see that script for the rules.
+//!
+//! `super::` rather than `crate::` because this file is compiled under
+//! two crate roots; see the `mod` block in `src/lib.rs`.
 
-use crate::pinyin::{Final, Initial};
+use super::pinyin::{Final, Initial};
 
 /// 声母, including the zero initial and the variant-select forms.
 pub static INITIALS: &[(&str, Initial)] = &[
