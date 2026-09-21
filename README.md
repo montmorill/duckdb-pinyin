@@ -1,4 +1,4 @@
-# pinyin
+# duck-pinyin
 
 A DuckDB extension that adds a **`PINYIN`** column type and **`pinyin_match`**,
 for filtering Chinese text by how it sounds rather than how it is written.
@@ -86,12 +86,12 @@ bit  4..0   声母 base
 
 which gives these masks:
 
-| field | mask | meaning |
-|---|---|---|
-| 声母 | `0x801F` | base plus the variant bit, so `ch` is one value, not `c` + something |
-| 韵母 | `0x7F00` | |
-| 声调 | `0x00E0` | `0x00` no tone written, `0x20` an explicit `0`, `0x60` 轻声, `0x80` 阴平, `0xA0` 阳平, `0xC0` 上声, `0xE0` 去声 |
-| syllable | `0xFF1F` | everything but the 声调 |
+| field    | mask       | meaning                                                                                                                         |
+| -------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| 声母     | `0x801F` | base plus the variant bit, so`ch` is one value, not `c` + something                                                         |
+| 韵母     | `0x7F00` |                                                                                                                                 |
+| 声调     | `0x00E0` | `0x00` no tone written, `0x20` an explicit `0`, `0x60` 轻声, `0x80` 阴平, `0xA0` 阳平, `0xC0` 上声, `0xE0` 去声 |
+| syllable | `0xFF1F` | everything but the 声调                                                                                                         |
 
 The split is **phonemic, not orthographic**: `chi` is ch·ri rather than ch·i,
 `zi` is z·ii, `ju` is j·v, `liu` is l·iou, `yan` is y·ian. `y` and `w` are
@@ -144,16 +144,16 @@ it may be replaced by a wildcard — and **a part that is simply not written is 
 wildcard too**. Matching is one masked compare on the packed value, so a filter
 costs a load and an `and`.
 
-| pattern | means | mask |
-|---|---|---|
+| pattern       | means                        | mask                   |
+| ------------- | ---------------------------- | ---------------------- |
 | `p?`, `p` | 声母 p, everything else free | `& 0x801F == 0x000E` |
-| `?ang` | 韵母 ang, 声母 and 声调 free | `& 0x7F00 == 0x0600` |
-| `zhong` | 声母 and 韵母 of `zhong` | `& 0xFF1F == 0x8E16` |
-| `zhong1` | ... and 阴平 | `& 0xFFFF == 0x8E96` |
-| `1` | any syllable in 阴平 | `& 0x00E0 == 0x0080` |
-| `?`, `*` | any syllable | matches all |
-| `/` | 零声母 | `& 0x801F == 0x0002` |
-| `&` | 伪声母 R — see below | `& 0x801F == 0x8010` |
+| `?ang`      | 韵母 ang, 声母 and 声调 free | `& 0x7F00 == 0x0600` |
+| `zhong`     | 声母 and 韵母 of`zhong`    | `& 0xFF1F == 0x8E16` |
+| `zhong1`    | ... and 阴平                 | `& 0xFFFF == 0x8E96` |
+| `1`         | any syllable in 阴平         | `& 0x00E0 == 0x0080` |
+| `?`, `*`  | any syllable                 | matches all            |
+| `/`         | 零声母                       | `& 0x801F == 0x0002` |
+| `&`         | 伪声母 R — see below        | `& 0x801F == 0x8010` |
 
 ```sql
 SELECT * FROM t WHERE pinyin_match(s, 'p?');    -- 声母 p
@@ -174,13 +174,13 @@ SELECT pinyin_match(v, 'zhong') FROM t(v);        -- v is VARCHAR
 The same function over a **list** of syllables, for filtering whole phrases. The
 pattern is the syllables separated by spaces, matched element by element:
 
-| pattern | means |
-|---|---|
-| `zhong guo` | exactly two syllables, 中 then 国 |
+| pattern          | means                                     |
+| ---------------- | ----------------------------------------- |
+| `zhong guo`    | exactly two syllables, 中 then 国         |
 | `zhong ** guo` | 中, then any number of syllables, then 国 |
-| `zhong **` | starts with 中 |
-| `p **` | starts with a 声母-p syllable |
-| `* *` | exactly two syllables, both free |
+| `zhong **`     | starts with 中                            |
+| `p **`         | starts with a 声母-p syllable             |
+| `* *`          | exactly two syllables, both free          |
 
 `**` is the only thing that is not a single syllable: it stands for any number
 of them, **including none**, so `zhong ** guo` matches both `[中, 国]` and
@@ -227,8 +227,7 @@ Three things worth knowing:
 
 - A 声调 **class** cannot be said by a single pattern, because 平声 spans two
   codes. Reach for `s::USMALLINT & 192` instead (see above).
-- A 声母 with the variant bit ignored — "`z` or `zh`" — likewise: `s::USMALLINT
-  & 31` is the base letter, so `(s::USMALLINT & 31) = 22` covers both `z` and
+- A 声母 with the variant bit ignored — "`z` or `zh`" — likewise: `s::USMALLINT & 31` is the base letter, so `(s::USMALLINT & 31) = 22` covers both `z` and
   `zh`, and `= 4` covers both `c` and `ch`. A pattern cannot, because the
   variant-select bit is part of the 声母 field.
 - `&` is the reference's 伪声母 R, which exists for the erhua tail `-r` (`huar`
